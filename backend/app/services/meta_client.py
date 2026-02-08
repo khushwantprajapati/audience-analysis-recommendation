@@ -1,6 +1,9 @@
-"""Meta Marketing API wrapper using direct Graph API calls (no SDK overhead)."""
+"""Meta Marketing API wrapper using direct Graph API calls with connection reuse,
+adaptive rate limiting, and batch support."""
+import json
 import logging
 import time
+import threading
 from typing import Any, Optional
 
 import httpx
@@ -16,6 +19,95 @@ GRAPH_BASE = "https://graph.facebook.com/v18.0"
 AD_SET_FIELDS = "id,name,campaign_id,daily_budget,created_time,targeting"
 INSIGHT_FIELDS = "spend,impressions,clicks,ctr,cpc,actions,action_values"
 
+# ── Adaptive rate-limit state ────────────────────────────────────
+_rate_lock = threading.Lock()
+_usage_pct: float = 0.0          # last known API usage percentage (0-100)
+_last_call_ts: float = 0.0       # timestamp of last API call
+
+# Delay thresholds based on usage %
+_DELAY_MAP = [
+    (80, 10.0),   # >=80% usage → 10s between calls
+    (60, 5.0),    # >=60% → 5s
+    (40, 2.0),    # >=40% → 2s
+    (20, 1.0),    # >=20% → 1s
+    (0, 0.3),     # <20%  → 0.3s
+]
+
+# ── Sync lock per account ────────────────────────────────────────
+_sync_locks: dict[str, threading.Lock] = {}
+_sync_locks_lock = threading.Lock()
+
+
+def get_sync_lock(account_id: str) -> threading.Lock:
+    """Get or create a per-account sync lock to prevent concurrent syncs."""
+    with _sync_locks_lock:
+        if account_id not in _sync_locks:
+            _sync_locks[account_id] = threading.Lock()
+        return _sync_locks[account_id]
+
+
+def _get_adaptive_delay() -> float:
+    """Return the appropriate delay based on current API usage percentage."""
+    with _rate_lock:
+        for threshold, delay in _DELAY_MAP:
+            if _usage_pct >= threshold:
+                return delay
+    return 0.3
+
+
+def _update_usage_from_headers(headers: httpx.Headers) -> None:
+    """Parse Meta's x-business-use-case-usage or x-app-usage headers to track API usage %."""
+    global _usage_pct
+
+    # x-business-use-case-usage: {"<ad_account_id>":[{"call_count":X,"total_cputime":Y,...}]}
+    biz_usage = headers.get("x-business-use-case-usage")
+    if biz_usage:
+        try:
+            data = json.loads(biz_usage)
+            max_pct = 0.0
+            for account_id, entries in data.items():
+                for entry in entries:
+                    for key in ("call_count", "total_cputime", "total_time"):
+                        val = entry.get(key, 0)
+                        if val > max_pct:
+                            max_pct = val
+            with _rate_lock:
+                _usage_pct = max_pct
+            if max_pct >= 50:
+                logger.info(f"Meta API usage: {max_pct:.0f}% (delay: {_get_adaptive_delay():.1f}s)")
+            return
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    # Fallback: x-app-usage: {"call_count":X,"total_cputime":Y,"total_time":Z}
+    app_usage = headers.get("x-app-usage")
+    if app_usage:
+        try:
+            data = json.loads(app_usage)
+            max_pct = max(
+                data.get("call_count", 0),
+                data.get("total_cputime", 0),
+                data.get("total_time", 0),
+            )
+            with _rate_lock:
+                _usage_pct = max_pct
+            if max_pct >= 50:
+                logger.info(f"Meta API usage (app): {max_pct:.0f}%")
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+
+def _adaptive_wait() -> None:
+    """Wait the appropriate amount based on current rate limit usage."""
+    global _last_call_ts
+    delay = _get_adaptive_delay()
+    with _rate_lock:
+        elapsed = time.time() - _last_call_ts
+        if elapsed < delay:
+            sleep_for = delay - elapsed
+            time.sleep(sleep_for)
+        _last_call_ts = time.time()
+
 
 def _ensure_act_prefix(account_id: str) -> str:
     if not account_id.startswith("act_"):
@@ -23,14 +115,25 @@ def _ensure_act_prefix(account_id: str) -> str:
     return account_id
 
 
-def _graph_get(access_token: str, path: str, params: dict | None = None, retries: int = 2) -> dict:
-    """Make a GET request to the Graph API with retry on rate limit."""
+def _graph_get(
+    client: httpx.Client,
+    access_token: str,
+    path: str,
+    params: dict | None = None,
+    retries: int = 3,
+) -> dict:
+    """Make a GET request to the Graph API with adaptive delays and retry on rate limit."""
     params = params or {}
     params["access_token"] = access_token
     url = f"{GRAPH_BASE}/{path}" if not path.startswith("http") else path
 
     for attempt in range(retries + 1):
-        resp = httpx.get(url, params=params, timeout=30)
+        _adaptive_wait()
+        resp = client.get(url, params=params, timeout=30)
+
+        # Always update usage tracking from response headers
+        _update_usage_from_headers(resp.headers)
+
         data = resp.json()
 
         if resp.status_code == 200:
@@ -38,9 +141,14 @@ def _graph_get(access_token: str, path: str, params: dict | None = None, retries
 
         error = data.get("error", {})
         code = error.get("code")
+
         if code in (17, 32, 4) and attempt < retries:
-            wait = 30 * (attempt + 1)
-            logger.warning(f"Rate limited (code {code}), waiting {wait}s before retry {attempt + 1}/{retries}")
+            # Exponential backoff: 30s, 60s, 120s
+            wait = 30 * (2 ** attempt)
+            logger.warning(
+                f"Rate limited (code {code}, usage ~{_usage_pct:.0f}%), "
+                f"waiting {wait}s before retry {attempt + 1}/{retries}"
+            )
             time.sleep(wait)
             continue
 
@@ -121,23 +229,114 @@ def _aggregate_daily_rows(rows: list[dict]) -> dict:
     }
 
 
-def get_ad_sets(access_token: str, account_id: str) -> list[dict]:
+def get_ad_sets(client: httpx.Client, access_token: str, account_id: str) -> list[dict]:
     """Fetch all ad sets for the account via Graph API."""
     account_id = _ensure_act_prefix(account_id)
     logger.info(f"Fetching ad sets for {account_id}")
-    data = _graph_get(access_token, f"{account_id}/adsets", {
+    data = _graph_get(client, access_token, f"{account_id}/adsets", {
         "fields": AD_SET_FIELDS,
         "limit": 200,
     })
     ad_sets = data.get("data", [])
     logger.info(f"Got {len(ad_sets)} ad sets")
     while data.get("paging", {}).get("next"):
-        data = _graph_get(access_token, data["paging"]["next"])
+        data = _graph_get(client, access_token, data["paging"]["next"])
         ad_sets.extend(data.get("data", []))
     return ad_sets
 
 
+# ── Batch API ────────────────────────────────────────────────────
+
+BATCH_SIZE = 50  # Meta allows max 50 per batch
+
+
+def _batch_insights(
+    client: httpx.Client,
+    access_token: str,
+    ad_set_ids: list[str],
+    date_preset: str,
+) -> dict[str, list[dict]]:
+    """
+    Fetch daily insight breakdowns for multiple ad sets in a single batch API call.
+    Returns {ad_set_id: [daily_rows]} for each ad set.
+    Meta Batch API: POST / with batch=[{method,relative_url},...] (max 50 per call).
+    """
+    result: dict[str, list[dict]] = {}
+
+    for i in range(0, len(ad_set_ids), BATCH_SIZE):
+        chunk = ad_set_ids[i : i + BATCH_SIZE]
+        batch_requests = []
+        for ad_set_id in chunk:
+            relative_url = (
+                f"{ad_set_id}/insights?"
+                f"fields={INSIGHT_FIELDS}&"
+                f"date_preset={date_preset}&"
+                f"time_increment=1"
+            )
+            batch_requests.append({"method": "GET", "relative_url": relative_url})
+
+        _adaptive_wait()
+        resp = client.post(
+            GRAPH_BASE,
+            data={
+                "access_token": access_token,
+                "batch": json.dumps(batch_requests),
+            },
+            timeout=60,
+        )
+
+        _update_usage_from_headers(resp.headers)
+
+        if resp.status_code != 200:
+            error_data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
+            error = error_data.get("error", {})
+            code = error.get("code")
+            if code in (17, 32, 4):
+                # Rate limited on batch call — wait and retry this chunk
+                wait = 60
+                logger.warning(f"Batch rate limited (code {code}), waiting {wait}s")
+                time.sleep(wait)
+                # Retry this chunk individually
+                for ad_set_id in chunk:
+                    try:
+                        rows = get_insights_daily(client, access_token, ad_set_id, date_preset)
+                        result[ad_set_id] = rows
+                    except Exception as e:
+                        logger.warning(f"Fallback insight fetch failed for {ad_set_id}: {e}")
+                        result[ad_set_id] = []
+                continue
+            raise Exception(f"Batch API error: {error.get('message', resp.text)} (code={code})")
+
+        batch_responses = resp.json()
+        if not isinstance(batch_responses, list):
+            logger.error(f"Unexpected batch response type: {type(batch_responses)}")
+            continue
+
+        for j, batch_resp in enumerate(batch_responses):
+            ad_set_id = chunk[j]
+            status = batch_resp.get("code", 0)
+            body_str = batch_resp.get("body", "{}")
+            try:
+                body = json.loads(body_str) if isinstance(body_str, str) else body_str
+            except json.JSONDecodeError:
+                body = {}
+
+            if status == 200:
+                rows = body.get("data", [])
+                rows.sort(key=lambda r: r.get("date_start", ""))
+                result[ad_set_id] = rows
+            else:
+                error = body.get("error", {})
+                logger.warning(
+                    f"Batch item {ad_set_id} failed: {error.get('message', f'status {status}')}"
+                )
+                result[ad_set_id] = []
+
+    return result
+
+
 def get_insights_daily(
+    client: httpx.Client,
     access_token: str,
     ad_set_id: str,
     date_preset: str,
@@ -146,7 +345,7 @@ def get_insights_daily(
     Get daily breakdown insights for an ad set. One API call.
     Returns list of raw daily rows sorted by date_start.
     """
-    data = _graph_get(access_token, f"{ad_set_id}/insights", {
+    data = _graph_get(client, access_token, f"{ad_set_id}/insights", {
         "fields": INSIGHT_FIELDS,
         "date_preset": date_preset,
         "time_increment": 1,
@@ -156,51 +355,15 @@ def get_insights_daily(
     return rows
 
 
-def get_insights_windows(
-    access_token: str,
-    ad_set_id: str,
-    date_preset: str = "last_7d",
-) -> dict[int, dict]:
+def aggregate_windows_from_rows(rows: list[dict]) -> dict[int, dict]:
     """
-    Single API call: fetch daily breakdown, then aggregate into 1d, 3d, 7d windows.
+    Aggregate daily rows into 1d, 3d, 7d windows.
     Returns {1: {...}, 3: {...}, 7: {...}} with metrics for each window.
-    Empty dict if no data.
     """
-    rows = get_insights_daily(access_token, ad_set_id, date_preset)
-    if not rows:
-        return {}
-    result = {}
-    # Full range = all rows (whatever the preset covers)
-    n = len(rows)
-    # 1d = last row only
-    if n >= 1:
-        result[1] = _compute_metrics_from_row(rows[-1])
-    # 3d = last 3 rows aggregated
-    if n >= 3:
-        result[3] = _aggregate_daily_rows(rows[-3:])
-    elif n >= 1:
-        result[3] = _aggregate_daily_rows(rows)
-    # 7d = all rows aggregated (since preset is last_7d)
-    result[7] = _aggregate_daily_rows(rows)
-    return result
-
-
-def get_insights_windows_flexible(
-    access_token: str,
-    ad_set_id: str,
-    date_preset: str = "last_7d",
-) -> dict[int, dict]:
-    """
-    Single API call with any date_preset. Fetches daily breakdown and aggregates
-    into 1d, 3d, 7d windows (using the last N days from available data).
-    Also stores the full-range aggregate under the total day count.
-    """
-    rows = get_insights_daily(access_token, ad_set_id, date_preset)
     if not rows:
         return {}
     result = {}
     n = len(rows)
-    # Always compute 1d, 3d, 7d from the tail
     if n >= 1:
         result[1] = _compute_metrics_from_row(rows[-1])
     if n >= 3:
@@ -212,6 +375,20 @@ def get_insights_windows_flexible(
     elif n >= 1:
         result[7] = _aggregate_daily_rows(rows)
     return result
+
+
+def get_insights_windows_flexible(
+    client: httpx.Client,
+    access_token: str,
+    ad_set_id: str,
+    date_preset: str = "last_7d",
+) -> dict[int, dict]:
+    """
+    Single API call with any date_preset. Fetches daily breakdown and aggregates
+    into 1d, 3d, 7d windows (using the last N days from available data).
+    """
+    rows = get_insights_daily(client, access_token, ad_set_id, date_preset)
+    return aggregate_windows_from_rows(rows)
 
 
 def infer_audience_type(ad_set_data: dict) -> str:
