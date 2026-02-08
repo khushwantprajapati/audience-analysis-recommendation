@@ -16,6 +16,7 @@ export default function DashboardPage() {
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [syncResult, setSyncResult] = useState<{ audiences_created: number; audiences_updated: number; snapshots_created: number; errors: string[] } | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [datePreset, setDatePreset] = useState("last_7d");
 
   const loadAccounts = useCallback(() => {
     api
@@ -53,7 +54,7 @@ export default function DashboardPage() {
     setSyncResult(null);
     setErrorMsg(null);
     api
-      .syncAccount(selectedAccountId)
+      .syncAccount(selectedAccountId, datePreset)
       .then((result) => {
         setSyncResult(result);
         if (result.errors?.length) {
@@ -96,6 +97,19 @@ export default function DashboardPage() {
                 {a.account_name || a.meta_account_id}
               </option>
             ))}
+          </select>
+          <select
+            value={datePreset}
+            onChange={(e) => setDatePreset(e.target.value)}
+            className="rounded-md border border-input bg-background px-3 py-2 text-sm"
+          >
+            <option value="yesterday">Yesterday</option>
+            <option value="last_3d">Last 3 days</option>
+            <option value="last_7d">Last 7 days</option>
+            <option value="last_14d">Last 14 days</option>
+            <option value="last_28d">Last 28 days</option>
+            <option value="last_30d">Last 30 days</option>
+            <option value="last_90d">Last 90 days</option>
           </select>
           <button
             onClick={handleSync}

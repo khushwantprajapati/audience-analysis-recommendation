@@ -1,5 +1,6 @@
 """Pull ad set data from Meta API and store in DB."""
 import logging
+import time
 import uuid
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
@@ -11,11 +12,18 @@ logger = logging.getLogger(__name__)
 from app.models import Account, Audience, MetricSnapshot
 from app.services.meta_client import (
     get_ad_sets,
-    get_insights_aggregate,
+    get_insights_windows_flexible,
     infer_audience_type,
     _ensure_act_prefix,
 )
 from app.utils.crypto import decrypt_token
+
+# Valid Meta date presets
+VALID_DATE_PRESETS = {
+    "yesterday", "last_3d", "last_7d", "last_14d", "last_28d", "last_30d",
+    "last_90d", "this_month", "last_month", "this_quarter", "last_quarter",
+    "this_year", "last_year", "maximum", "data_maximum",
+}
 
 
 def _parse_launched_at(ad_set_data: dict) -> datetime | None:
@@ -35,24 +43,28 @@ def _budget_from_ad_set(ad_set_data: dict) -> Decimal | None:
     b = ad_set_data.get("daily_budget")
     if b is None:
         return None
-    # API returns in cents for some currencies
     try:
         return Decimal(str(b)) / 100 if int(b) > 10000 else Decimal(str(b))
     except (TypeError, ValueError):
         return None
 
 
-def sync_account(account_id: str, db: Session) -> dict:
+def sync_account(account_id: str, db: Session, date_preset: str = "last_7d") -> dict:
     """
-    Sync ad sets and insights for an account. Creates/updates Audience and MetricSnapshot rows.
-    Returns summary: audiences_created, audiences_updated, snapshots_created, errors.
+    Sync ad sets and insights for an account.
+    Uses a single API call per ad set (daily breakdown), then aggregates into 1d/3d/7d windows.
+    date_preset: controls how far back to fetch (default last_7d).
+    Returns summary dict.
     """
+    if date_preset not in VALID_DATE_PRESETS:
+        date_preset = "last_7d"
+
     account = db.query(Account).filter(Account.id == account_id).first()
     if not account:
         return {"error": "Account not found"}
     token = decrypt_token(account.access_token)
     meta_id = _ensure_act_prefix(account.meta_account_id)
-    logger.info(f"Syncing account {account.account_name} ({meta_id})")
+    logger.info(f"Syncing account {account.account_name} ({meta_id}) with preset={date_preset}")
 
     summary = {"audiences_created": 0, "audiences_updated": 0, "snapshots_created": 0, "errors": []}
     try:
@@ -64,11 +76,6 @@ def sync_account(account_id: str, db: Session) -> dict:
         return summary
 
     today = date.today()
-    date_presets = [
-        ("last_1d", 1),
-        ("last_3d", 3),
-        ("last_7d", 7),
-    ]
 
     for ad_set_data in ad_sets_data:
         meta_ad_set_id = ad_set_data.get("id")
@@ -108,15 +115,16 @@ def sync_account(account_id: str, db: Session) -> dict:
             audience.campaign_name = campaign_name
             summary["audiences_updated"] += 1
 
-        for date_preset, window_days in date_presets:
-            try:
-                ins = get_insights_aggregate(token, meta_ad_set_id, date_preset)
-            except Exception as e:
-                logger.warning(f"Insight fetch failed for {name} ({date_preset}): {e}")
-                summary["errors"].append(f"{meta_ad_set_id} {date_preset}: {e}")
-                continue
-            if not ins:
-                continue
+        # Single API call: fetch daily breakdown, aggregate into 1d/3d/7d
+        try:
+            windows = get_insights_windows_flexible(token, meta_ad_set_id, date_preset)
+            time.sleep(0.2)  # small pause to stay under rate limits
+        except Exception as e:
+            logger.warning(f"Insight fetch failed for {name}: {e}")
+            summary["errors"].append(f"{meta_ad_set_id}: {e}")
+            continue
+
+        for window_days, ins in windows.items():
             existing = (
                 db.query(MetricSnapshot)
                 .filter(

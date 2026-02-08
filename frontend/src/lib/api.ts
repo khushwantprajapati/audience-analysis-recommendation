@@ -27,9 +27,9 @@ export const api = {
       `/api/recommendations/generate?account_id=${encodeURIComponent(accountId)}`,
       { method: "POST" }
     ),
-  syncAccount: (accountId: string) =>
+  syncAccount: (accountId: string, datePreset: string = "last_7d") =>
     fetchApi<{ audiences_created: number; audiences_updated: number; snapshots_created: number; errors: string[] }>(
-      `/api/ingestion/sync/${accountId}`,
+      `/api/ingestion/sync/${accountId}?date_preset=${encodeURIComponent(datePreset)}`,
       { method: "POST" }
     ),
   getSettings: () => fetchApi<SettingsResponse>("/api/settings"),

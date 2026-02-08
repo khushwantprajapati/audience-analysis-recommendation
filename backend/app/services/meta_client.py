@@ -1,35 +1,20 @@
-"""Meta Marketing API wrapper using facebook-business SDK."""
-from datetime import datetime, timedelta, timezone
-from decimal import Decimal
+"""Meta Marketing API wrapper using direct Graph API calls (no SDK overhead)."""
+import logging
+import time
 from typing import Any, Optional
 
-from facebook_business.api import FacebookAdsApi
-from facebook_business.adobjects.adaccount import AdAccount
-from facebook_business.adobjects.adset import AdSet
-from facebook_business.adobjects.adsinsights import AdsInsights
+import httpx
 
 from app.config import get_settings
 from app.utils.crypto import decrypt_token
 
-# Insight fields we need
-INSIGHT_FIELDS = [
-    AdsInsights.Field.spend,
-    AdsInsights.Field.impressions,
-    AdsInsights.Field.clicks,
-    AdsInsights.Field.ctr,
-    AdsInsights.Field.cpc,
-    AdsInsights.Field.actions,
-    AdsInsights.Field.action_values,
-]
+logger = logging.getLogger(__name__)
 
-AD_SET_FIELDS = [
-    AdSet.Field.id,
-    AdSet.Field.name,
-    AdSet.Field.campaign_id,
-    AdSet.Field.daily_budget,
-    AdSet.Field.created_time,
-    AdSet.Field.targeting,
-]
+GRAPH_BASE = "https://graph.facebook.com/v18.0"
+
+# Fields we request
+AD_SET_FIELDS = "id,name,campaign_id,daily_budget,created_time,targeting"
+INSIGHT_FIELDS = "spend,impressions,clicks,ctr,cpc,actions,action_values"
 
 
 def _ensure_act_prefix(account_id: str) -> str:
@@ -38,19 +23,35 @@ def _ensure_act_prefix(account_id: str) -> str:
     return account_id
 
 
-def init_api(access_token: str) -> None:
-    """Initialize the Facebook Ads API with the given token."""
-    settings = get_settings()
-    plain = decrypt_token(access_token) if access_token else ""
-    FacebookAdsApi.init(
-        app_id=settings.meta_app_id or None,
-        app_secret=settings.meta_app_secret or None,
-        access_token=plain,
-    )
+def _graph_get(access_token: str, path: str, params: dict | None = None, retries: int = 2) -> dict:
+    """Make a GET request to the Graph API with retry on rate limit."""
+    params = params or {}
+    params["access_token"] = access_token
+    url = f"{GRAPH_BASE}/{path}" if not path.startswith("http") else path
+
+    for attempt in range(retries + 1):
+        resp = httpx.get(url, params=params, timeout=30)
+        data = resp.json()
+
+        if resp.status_code == 200:
+            return data
+
+        error = data.get("error", {})
+        code = error.get("code")
+        if code in (17, 32, 4) and attempt < retries:
+            wait = 30 * (attempt + 1)
+            logger.warning(f"Rate limited (code {code}), waiting {wait}s before retry {attempt + 1}/{retries}")
+            time.sleep(wait)
+            continue
+
+        raise Exception(
+            f"Graph API error: {error.get('message', resp.text)} "
+            f"(code={code}, status={resp.status_code})"
+        )
+    return {}
 
 
 def _parse_actions(insight: dict, action_type: str) -> int:
-    """Sum count for action_type from insight['actions'] (list of {action_type, value})."""
     actions = insight.get("actions") or []
     total = 0
     for a in actions:
@@ -60,7 +61,6 @@ def _parse_actions(insight: dict, action_type: str) -> int:
 
 
 def _parse_action_values(insight: dict, action_type: str) -> float:
-    """Sum value for action_type from insight['action_values']."""
     values = insight.get("action_values") or []
     total = 0.0
     for v in values:
@@ -69,81 +69,149 @@ def _parse_action_values(insight: dict, action_type: str) -> float:
     return total
 
 
+def _compute_metrics_from_row(d: dict) -> dict:
+    """Parse a single insight row into our standard metrics dict."""
+    spend = float(d.get("spend") or 0)
+    purchases = _parse_actions(d, "purchase") + _parse_actions(d, "omni_purchase")
+    revenue = _parse_action_values(d, "purchase") + _parse_action_values(d, "omni_purchase")
+    clicks = int(d.get("clicks") or 0)
+    impressions = int(d.get("impressions") or 0)
+    ctr = float(d.get("ctr") or 0) if d.get("ctr") else None
+    cpc = float(d.get("cpc") or 0) if d.get("cpc") else None
+    roas = (revenue / spend) if spend > 0 else None
+    cpa = (spend / purchases) if purchases > 0 else None
+    cvr = (purchases / clicks) if clicks > 0 else None
+    return {
+        "spend": spend,
+        "revenue": revenue,
+        "purchases": purchases,
+        "impressions": impressions,
+        "clicks": clicks,
+        "ctr": ctr,
+        "cpc": cpc,
+        "roas": roas,
+        "cpa": cpa,
+        "cvr": cvr,
+    }
+
+
+def _aggregate_daily_rows(rows: list[dict]) -> dict:
+    """Sum daily insight rows into one aggregate."""
+    spend = sum(float(r.get("spend") or 0) for r in rows)
+    clicks = sum(int(r.get("clicks") or 0) for r in rows)
+    impressions = sum(int(r.get("impressions") or 0) for r in rows)
+    purchases = sum(_parse_actions(r, "purchase") + _parse_actions(r, "omni_purchase") for r in rows)
+    revenue = sum(_parse_action_values(r, "purchase") + _parse_action_values(r, "omni_purchase") for r in rows)
+    ctr = (clicks / impressions * 100) if impressions > 0 else None
+    cpc = (spend / clicks) if clicks > 0 else None
+    roas = (revenue / spend) if spend > 0 else None
+    cpa = (spend / purchases) if purchases > 0 else None
+    cvr = (purchases / clicks) if clicks > 0 else None
+    return {
+        "spend": spend,
+        "revenue": revenue,
+        "purchases": purchases,
+        "impressions": impressions,
+        "clicks": clicks,
+        "ctr": ctr,
+        "cpc": cpc,
+        "roas": roas,
+        "cpa": cpa,
+        "cvr": cvr,
+    }
+
+
 def get_ad_sets(access_token: str, account_id: str) -> list[dict]:
-    """Fetch all ad sets for the account. Returns list of dicts with id, name, campaign_id, daily_budget, created_time, targeting."""
-    init_api(access_token)
+    """Fetch all ad sets for the account via Graph API."""
     account_id = _ensure_act_prefix(account_id)
-    account = AdAccount(account_id)
-    ad_sets = account.get_ad_sets(fields=AD_SET_FIELDS)
-    result = []
-    for ad_set in ad_sets:
-        d = dict(ad_set)
-        result.append(d)
-    return result
+    logger.info(f"Fetching ad sets for {account_id}")
+    data = _graph_get(access_token, f"{account_id}/adsets", {
+        "fields": AD_SET_FIELDS,
+        "limit": 200,
+    })
+    ad_sets = data.get("data", [])
+    logger.info(f"Got {len(ad_sets)} ad sets")
+    while data.get("paging", {}).get("next"):
+        data = _graph_get(access_token, data["paging"]["next"])
+        ad_sets.extend(data.get("data", []))
+    return ad_sets
 
 
-def get_insights_for_ad_set(
+def get_insights_daily(
     access_token: str,
     ad_set_id: str,
     date_preset: str,
 ) -> list[dict]:
     """
-    Get insights for one ad set over a time range.
-    date_preset: 'last_1d', 'last_3d', 'last_7d', or use time_range.
-    Returns list of insight dicts (one per day if breakdown by day).
+    Get daily breakdown insights for an ad set. One API call.
+    Returns list of raw daily rows sorted by date_start.
     """
-    init_api(access_token)
-    from facebook_business.adobjects.adset import AdSet as AdSetObj
-    ad_set = AdSetObj(ad_set_id)
-    params = {"date_preset": date_preset, "time_increment": 1}
-    insights = ad_set.get_insights(fields=INSIGHT_FIELDS, params=params)
-    result = []
-    for ins in insights:
-        result.append(dict(ins))
+    data = _graph_get(access_token, f"{ad_set_id}/insights", {
+        "fields": INSIGHT_FIELDS,
+        "date_preset": date_preset,
+        "time_increment": 1,
+    })
+    rows = data.get("data", [])
+    rows.sort(key=lambda r: r.get("date_start", ""))
+    return rows
+
+
+def get_insights_windows(
+    access_token: str,
+    ad_set_id: str,
+    date_preset: str = "last_7d",
+) -> dict[int, dict]:
+    """
+    Single API call: fetch daily breakdown, then aggregate into 1d, 3d, 7d windows.
+    Returns {1: {...}, 3: {...}, 7: {...}} with metrics for each window.
+    Empty dict if no data.
+    """
+    rows = get_insights_daily(access_token, ad_set_id, date_preset)
+    if not rows:
+        return {}
+    result = {}
+    # Full range = all rows (whatever the preset covers)
+    n = len(rows)
+    # 1d = last row only
+    if n >= 1:
+        result[1] = _compute_metrics_from_row(rows[-1])
+    # 3d = last 3 rows aggregated
+    if n >= 3:
+        result[3] = _aggregate_daily_rows(rows[-3:])
+    elif n >= 1:
+        result[3] = _aggregate_daily_rows(rows)
+    # 7d = all rows aggregated (since preset is last_7d)
+    result[7] = _aggregate_daily_rows(rows)
     return result
 
 
-def get_insights_aggregate(
+def get_insights_windows_flexible(
     access_token: str,
     ad_set_id: str,
-    date_preset: str,
-) -> Optional[dict]:
+    date_preset: str = "last_7d",
+) -> dict[int, dict]:
     """
-    Get single aggregate insight for ad set over the period (no time_increment).
-    Returns one dict with spend, purchases, revenue, etc. or None if no data.
+    Single API call with any date_preset. Fetches daily breakdown and aggregates
+    into 1d, 3d, 7d windows (using the last N days from available data).
+    Also stores the full-range aggregate under the total day count.
     """
-    init_api(access_token)
-    from facebook_business.adobjects.adset import AdSet as AdSetObj
-    ad_set = AdSetObj(ad_set_id)
-    params = {"date_preset": date_preset}
-    insights = ad_set.get_insights(fields=INSIGHT_FIELDS, params=params)
-    for ins in insights:
-        d = dict(ins)
-        spend = float(d.get("spend") or 0)
-        purchases = _parse_actions(d, "purchase") + _parse_actions(d, "omni_purchase")
-        revenue = _parse_action_values(d, "purchase") + _parse_action_values(d, "omni_purchase")
-        clicks = int(d.get("clicks") or 0)
-        impressions = int(d.get("impressions") or 0)
-        ctr = float(d.get("ctr") or 0) if d.get("ctr") else None
-        cpc = float(d.get("cpc") or 0) if d.get("cpc") else None
-        roas = (revenue / spend) if spend > 0 else None
-        cpa = (spend / purchases) if purchases > 0 else None
-        cvr = (purchases / clicks) if clicks > 0 else None
-        return {
-            "spend": spend,
-            "revenue": revenue,
-            "purchases": purchases,
-            "impressions": impressions,
-            "clicks": clicks,
-            "ctr": ctr,
-            "cpc": cpc,
-            "roas": roas,
-            "cpa": cpa,
-            "cvr": cvr,
-            "date_start": d.get("date_start"),
-            "date_stop": d.get("date_stop"),
-        }
-    return None
+    rows = get_insights_daily(access_token, ad_set_id, date_preset)
+    if not rows:
+        return {}
+    result = {}
+    n = len(rows)
+    # Always compute 1d, 3d, 7d from the tail
+    if n >= 1:
+        result[1] = _compute_metrics_from_row(rows[-1])
+    if n >= 3:
+        result[3] = _aggregate_daily_rows(rows[-3:])
+    elif n >= 1:
+        result[3] = _aggregate_daily_rows(rows)
+    if n >= 7:
+        result[7] = _aggregate_daily_rows(rows[-7:])
+    elif n >= 1:
+        result[7] = _aggregate_daily_rows(rows)
+    return result
 
 
 def infer_audience_type(ad_set_data: dict) -> str:
@@ -151,7 +219,6 @@ def infer_audience_type(ad_set_data: dict) -> str:
     targeting = ad_set_data.get("targeting") or {}
     if not targeting:
         return "BROAD"
-    # Check for lookalike
     if targeting.get("flexible_spec") or targeting.get("custom_audiences"):
         for spec in (targeting.get("flexible_spec") or []) + (targeting.get("custom_audiences") or []):
             if isinstance(spec, dict):

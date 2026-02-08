@@ -104,10 +104,6 @@ async def meta_callback(code: str | None = None, error: str | None = None, db: S
                 status_code=400,
                 detail="No ad accounts found for this user. Ensure ads_read and ads_management are granted.",
             )
-        # Use first account
-        ad_account = ad_accounts[0]
-        meta_account_id = ad_account.get("account_id") or ad_account.get("id", "")
-        account_name = ad_account.get("name") or f"Account {meta_account_id}"
     # End httpx
 
     from datetime import datetime, timezone, timedelta
@@ -115,25 +111,32 @@ async def meta_callback(code: str | None = None, error: str | None = None, db: S
     if expires_in:
         token_expires_at = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
 
-    existing = db.query(Account).filter(Account.meta_account_id == meta_account_id).first()
-    if existing:
-        existing.access_token = encrypt_token(long_lived_token)
-        existing.token_expires_at = token_expires_at
-        existing.account_name = account_name
-        db.commit()
-        db.refresh(existing)
-        account_id = existing.id
-    else:
-        account_id = str(uuid.uuid4())
-        account = Account(
-            id=account_id,
-            meta_account_id=meta_account_id,
-            account_name=account_name,
-            access_token=encrypt_token(long_lived_token),
-            token_expires_at=token_expires_at,
-        )
-        db.add(account)
-        db.commit()
+    encrypted_token = encrypt_token(long_lived_token)
+
+    # Store ALL ad accounts, not just the first
+    for ad_account in ad_accounts:
+        meta_account_id = ad_account.get("account_id") or ad_account.get("id", "")
+        if not meta_account_id:
+            continue
+        # Strip "act_" prefix if present in account_id
+        meta_account_id = meta_account_id.replace("act_", "")
+        account_name = ad_account.get("name") or f"Account {meta_account_id}"
+
+        existing = db.query(Account).filter(Account.meta_account_id == meta_account_id).first()
+        if existing:
+            existing.access_token = encrypted_token
+            existing.token_expires_at = token_expires_at
+            existing.account_name = account_name
+        else:
+            account = Account(
+                id=str(uuid.uuid4()),
+                meta_account_id=meta_account_id,
+                account_name=account_name,
+                access_token=encrypted_token,
+                token_expires_at=token_expires_at,
+            )
+            db.add(account)
+    db.commit()
 
     from fastapi.responses import RedirectResponse
     frontend = settings.frontend_url.rstrip("/")
