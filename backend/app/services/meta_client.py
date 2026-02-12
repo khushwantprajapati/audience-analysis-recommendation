@@ -393,6 +393,7 @@ def _send_batch_with_retry(
 
         # Check if any individual items in the batch were rate-limited
         rate_limited_ids = []
+        rate_limited_errors: list[dict[str, Any]] = []
         for j, batch_resp in enumerate(batch_responses):
             ad_set_id = chunk[j]
             status = batch_resp.get("code", 0)
@@ -411,6 +412,7 @@ def _send_batch_with_retry(
                 err_code = error.get("code")
                 if err_code in (17, 32, 4):
                     rate_limited_ids.append(ad_set_id)
+                    rate_limited_errors.append(error)
                 else:
                     logger.warning(
                         f"Batch item {ad_set_id} failed: "
