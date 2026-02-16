@@ -1,15 +1,30 @@
 "use client";
 
-import { Suspense, useCallback, useEffect, useState } from "react";
+import { Suspense, useCallback, useEffect, useMemo, useState } from "react";
 import { useSearchParams } from "next/navigation";
 import Link from "next/link";
 import { Nav } from "@/components/nav";
 import { RecommendationBadge } from "@/components/recommendation-badge";
-import { api, type Account, type Recommendation, type SyncStatus } from "@/lib/api";
+import {
+  api,
+  type Account,
+  type Recommendation,
+  type SyncJobStatus,
+  type SyncStatus,
+} from "@/lib/api";
 
 export default function DashboardPage() {
   return (
-    <Suspense fallback={<div className="min-h-screen bg-background"><Nav /><main className="mx-auto max-w-6xl px-4 py-6"><p className="text-muted-foreground">Loading…</p></main></div>}>
+    <Suspense
+      fallback={
+        <div className="min-h-screen bg-background">
+          <Nav />
+          <main className="mx-auto max-w-6xl px-4 py-6">
+            <p className="text-muted-foreground">Loading…</p>
+          </main>
+        </div>
+      }
+    >
       <DashboardContent />
     </Suspense>
   );
@@ -26,17 +41,17 @@ function DashboardContent() {
   const [syncing, setSyncing] = useState(false);
   const [generating, setGenerating] = useState(false);
   const [expandedId, setExpandedId] = useState<string | null>(null);
-  const [syncResult, setSyncResult] = useState<{ audiences_created: number; audiences_updated: number; snapshots_created: number; errors: string[] } | null>(null);
+  const [syncResult, setSyncResult] = useState<SyncJobStatus["summary"]>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [datePreset, setDatePreset] = useState("last_7d");
   const [syncStatus, setSyncStatus] = useState<SyncStatus | null>(null);
+  const [syncJob, setSyncJob] = useState<SyncJobStatus | null>(null);
 
   const loadAccounts = useCallback(() => {
     api
       .getAccounts()
       .then((r) => {
         setAccounts(r.accounts);
-        // Only set initial selection — subsequent changes come from the dropdown
         setSelectedAccountId((prev) => {
           if (prev) return prev;
           const urlMatch = accountFromUrl ? r.accounts.find((a) => a.id === accountFromUrl) : null;
@@ -54,6 +69,23 @@ function DashboardContent() {
     }
     api.getSyncStatus(selectedAccountId).then(setSyncStatus).catch(() => setSyncStatus(null));
   }, [selectedAccountId]);
+
+  const loadSyncJob = useCallback(() => {
+    if (!selectedAccountId) {
+      setSyncJob(null);
+      return;
+    }
+    api.getSyncJobStatus(selectedAccountId).then((job) => {
+      setSyncJob(job);
+      if (job.summary) {
+        setSyncResult(job.summary);
+      }
+      if (job.status === "completed" || job.status === "failed" || job.status === "cancelled") {
+        setSyncing(false);
+        loadSyncStatus();
+      }
+    }).catch(() => setSyncJob(null));
+  }, [selectedAccountId, loadSyncStatus]);
 
   const loadRecommendations = useCallback(() => {
     if (!selectedAccountId) return;
@@ -73,11 +105,21 @@ function DashboardContent() {
     if (selectedAccountId) {
       loadRecommendations();
       loadSyncStatus();
+      loadSyncJob();
     } else {
       setRecommendations([]);
       setSyncStatus(null);
+      setSyncJob(null);
     }
-  }, [selectedAccountId, loadRecommendations, loadSyncStatus]);
+  }, [selectedAccountId, loadRecommendations, loadSyncStatus, loadSyncJob]);
+
+  useEffect(() => {
+    if (!selectedAccountId || !syncing) return;
+    const timer = window.setInterval(() => {
+      loadSyncJob();
+    }, 2500);
+    return () => window.clearInterval(timer);
+  }, [selectedAccountId, syncing, loadSyncJob]);
 
   const handleSync = () => {
     if (!selectedAccountId) return;
@@ -87,15 +129,25 @@ function DashboardContent() {
     api
       .syncAccount(selectedAccountId, datePreset)
       .then((result) => {
-        setSyncResult(result);
-        if (result.errors?.length) {
-          setErrorMsg(`Sync finished with ${result.errors.length} error(s)`);
+        if (result.status === "in_progress") {
+          loadSyncJob();
         }
-        loadRecommendations();
-        loadSyncStatus();
       })
-      .catch((e) => setErrorMsg(`Sync failed: ${e.message}`))
-      .finally(() => setSyncing(false));
+      .catch((e) => {
+        setErrorMsg(`Sync failed: ${e.message}`);
+        setSyncing(false);
+      });
+  };
+
+  const handleCancelSync = () => {
+    if (!selectedAccountId) return;
+    api
+      .cancelSync(selectedAccountId)
+      .then((result) => {
+        setErrorMsg(result.message);
+        loadSyncJob();
+      })
+      .catch((e) => setErrorMsg(`Cancel failed: ${e.message}`));
   };
 
   const handleGenerate = () => {
@@ -116,6 +168,15 @@ function DashboardContent() {
   const average = recommendations.filter((r) => r.performance_bucket === "AVERAGE").length;
   const losers = recommendations.filter((r) => r.performance_bucket === "LOSER").length;
   const canGenerate = syncStatus?.can_generate ?? false;
+  const syncInProgress = syncing || syncJob?.status === "in_progress";
+
+  const syncHint = useMemo(() => {
+    if (syncInProgress) return "Sync in progress…";
+    if (syncJob?.status === "failed") return syncJob.message ?? "Sync failed";
+    if (syncJob?.status === "cancelled") return "Sync cancelled";
+    if (syncJob?.status === "completed") return "Sync completed";
+    return null;
+  }, [syncJob, syncInProgress]);
 
   const formatTimeAgo = (iso: string) => {
     const diff = Date.now() - new Date(iso).getTime();
@@ -160,10 +221,17 @@ function DashboardContent() {
           </select>
           <button
             onClick={handleSync}
-            disabled={!selectedAccountId || syncing}
+            disabled={!selectedAccountId || syncInProgress}
             className="rounded-lg bg-secondary px-4 py-2 text-sm font-medium text-secondary-foreground hover:bg-secondary/80 disabled:opacity-50"
           >
-            {syncing ? "Syncing…" : "Sync now"}
+            {syncInProgress ? "Syncing…" : "Sync now"}
+          </button>
+          <button
+            onClick={handleCancelSync}
+            disabled={!selectedAccountId || !syncInProgress}
+            className="rounded-lg border border-border px-4 py-2 text-sm font-medium hover:bg-muted disabled:opacity-50"
+          >
+            Cancel sync
           </button>
           <button
             onClick={handleGenerate}
@@ -174,6 +242,10 @@ function DashboardContent() {
             {generating ? "Generating…" : "Generate recommendations"}
           </button>
         </div>
+
+        {syncHint && (
+          <div className="mb-3 rounded-lg border border-border bg-muted/30 p-2 text-sm text-muted-foreground">{syncHint}</div>
+        )}
 
         {selectedAccountId && syncStatus && (
           <div className="mb-4 flex flex-wrap items-center gap-4 text-sm text-muted-foreground">
@@ -195,25 +267,13 @@ function DashboardContent() {
             <span>
               With data: <span className="font-medium text-foreground">{syncStatus.audiences_with_data}</span>
             </span>
-            {!canGenerate && syncStatus.audience_count > 0 && (
-              <>
-                <span className="text-border">|</span>
-                <span className="text-amber-600">Sync data to enable recommendations</span>
-              </>
-            )}
-            {!canGenerate && syncStatus.audience_count === 0 && (
-              <>
-                <span className="text-border">|</span>
-                <span className="text-amber-600">Sync to pull audiences from Meta</span>
-              </>
-            )}
           </div>
         )}
 
         {syncResult && (
           <div className={`mb-4 rounded-lg border p-3 text-sm ${syncResult.errors?.length ? "border-amber-300 bg-amber-50 dark:border-amber-800 dark:bg-amber-950" : "border-emerald-300 bg-emerald-50 dark:border-emerald-800 dark:bg-emerald-950"}`}>
             <p className="font-medium">
-              Sync complete: {syncResult.audiences_created} audiences created, {syncResult.audiences_updated} updated, {syncResult.snapshots_created} snapshots
+              Sync result: {syncResult.audiences_created} audiences created, {syncResult.audiences_updated} updated, {syncResult.snapshots_created} snapshots
             </p>
             {syncResult.errors?.length > 0 && (
               <details className="mt-1">
@@ -229,6 +289,7 @@ function DashboardContent() {
             )}
           </div>
         )}
+
         {errorMsg && (
           <div className="mb-4 rounded-lg border border-red-300 bg-red-50 p-3 text-sm text-red-800 dark:border-red-800 dark:bg-red-950 dark:text-red-300">
             {errorMsg}
@@ -258,6 +319,10 @@ function DashboardContent() {
           <p className="text-muted-foreground">Loading…</p>
         ) : !selectedAccountId ? (
           <p className="text-muted-foreground">Select an account or connect one from the home page.</p>
+        ) : recommendations.length === 0 ? (
+          <div className="rounded-lg border border-border bg-card p-4 text-sm text-muted-foreground">
+            No recommendations yet. If sync fetched data, click <span className="font-medium text-foreground">Generate recommendations</span> to display it.
+          </div>
         ) : (
           <div className="overflow-hidden rounded-lg border border-border bg-card">
             <div className="overflow-x-auto">
@@ -302,29 +367,6 @@ function DashboardContent() {
                 </tbody>
               </table>
             </div>
-            {recommendations.map((r) => {
-              if (expandedId !== r.id) return null;
-              return (
-                <div key={r.id} className="border-t border-border bg-muted/20 px-4 py-3 text-sm">
-                  <p className="font-medium text-foreground">Reasons</p>
-                  <ul className="list-inside list-disc text-muted-foreground">
-                    {(r.reasons || []).map((s, i) => (
-                      <li key={i}>{s}</li>
-                    ))}
-                  </ul>
-                  {r.risks && r.risks.length > 0 && (
-                    <>
-                      <p className="mt-2 font-medium text-foreground">Risks</p>
-                      <ul className="list-inside list-disc text-muted-foreground">
-                        {r.risks.map((s, i) => (
-                          <li key={i}>{s}</li>
-                        ))}
-                      </ul>
-                    </>
-                  )}
-                </div>
-              );
-            })}
           </div>
         )}
       </main>

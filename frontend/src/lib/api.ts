@@ -14,6 +14,21 @@ async function fetchApi<T>(path: string, options?: RequestInit): Promise<T> {
   return res.json() as Promise<T>;
 }
 
+export type SyncJobStatus = {
+  status: "idle" | "in_progress" | "completed" | "failed" | "cancelled";
+  message: string | null;
+  started_at: string | null;
+  finished_at: string | null;
+  summary: {
+    audiences_created: number;
+    audiences_updated: number;
+    snapshots_created: number;
+    errors: string[];
+    cancelled?: boolean;
+  } | null;
+  date_preset: string | null;
+};
+
 export const api = {
   getAccounts: () => fetchApi<{ accounts: Account[] }>("/api/accounts"),
   getAccount: (id: string) => fetchApi<Account>(`/api/accounts/${id}`),
@@ -30,10 +45,16 @@ export const api = {
       { method: "POST" }
     ),
   syncAccount: (accountId: string, datePreset: string = "last_7d") =>
-    fetchApi<{ audiences_created: number; audiences_updated: number; snapshots_created: number; errors: string[] }>(
+    fetchApi<{ status: string; message: string; started_at?: string }>(
       `/api/ingestion/sync/${accountId}?date_preset=${encodeURIComponent(datePreset)}`,
       { method: "POST" }
     ),
+  getSyncJobStatus: (accountId: string) =>
+    fetchApi<SyncJobStatus>(`/api/ingestion/sync/${accountId}/status`),
+  cancelSync: (accountId: string) =>
+    fetchApi<{ status: string; message: string }>(`/api/ingestion/sync/${accountId}/cancel`, {
+      method: "POST",
+    }),
   getSettings: () => fetchApi<SettingsResponse>("/api/settings"),
   updateSettings: (settings: Partial<SettingsResponse>) =>
     fetchApi<SettingsResponse>("/api/settings", {
