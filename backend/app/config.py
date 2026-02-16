@@ -28,7 +28,7 @@ class Settings(BaseSettings):
     meta_base_delay_seconds: float = 1.0
     meta_batch_size: int = 20
 
->>>>main
+    main
     meta_max_backoff_seconds: int = 900
 
     # Anthropic
