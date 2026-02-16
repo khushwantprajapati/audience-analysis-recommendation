@@ -27,7 +27,8 @@ class Settings(BaseSettings):
     meta_redirect_uri: str = "http://localhost:8000/api/auth/meta/callback"
     meta_base_delay_seconds: float = 1.0
     meta_batch_size: int = 20
-    meta_initial_backoff_seconds: int = 20
+
+    main
     meta_max_backoff_seconds: int = 900
 
     # Anthropic
