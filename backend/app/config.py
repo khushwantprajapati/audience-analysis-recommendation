@@ -4,6 +4,12 @@ from typing import Optional
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+# Defensive sentinels: if a bad merge leaves a bare `main`/`HEAD` token in this
+# module, it should not crash app startup with NameError. Preflight still reports
+# this as an error so it can be fixed properly.
+main = None
+HEAD = None
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -25,6 +31,10 @@ class Settings(BaseSettings):
     meta_app_id: str = ""
     meta_app_secret: str = ""
     meta_redirect_uri: str = "http://localhost:8000/api/auth/meta/callback"
+    meta_base_delay_seconds: float = 1.0
+    meta_batch_size: int = 20
+    meta_initial_backoff_seconds: int = 20
+    meta_max_backoff_seconds: int = 900
 
     # Anthropic
     anthropic_api_key: str = ""
