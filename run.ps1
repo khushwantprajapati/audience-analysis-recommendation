@@ -190,7 +190,7 @@ Write-Host "  API Docs:  http://localhost:8000/docs"
 Write-Host ""
 
 # Start backend in new window
-Start-Process powershell -ArgumentList "-NoExit", "-Command", "Set-Location '$PSScriptRoot\backend'; Write-Host 'Starting backend on port 8000...' -ForegroundColor Green; uvicorn app.main:app --reload --port 8000" -WindowStyle Normal
+Start-Process powershell -ArgumentList "-NoExit", "-ExecutionPolicy", "Bypass", "-File", "$PSScriptRoot\backend\start_backend.ps1", "-Port", "8000" -WindowStyle Normal
 
 Write-Host "Waiting for backend to start..." -ForegroundColor Yellow
 Start-Sleep -Seconds 4

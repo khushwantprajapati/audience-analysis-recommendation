@@ -12,6 +12,7 @@ from app.config import get_settings
 from app.utils.crypto import decrypt_token
 
 logger = logging.getLogger(__name__)
+settings = get_settings()
 
 GRAPH_BASE = "https://graph.facebook.com/v18.0"
 
@@ -32,7 +33,7 @@ _DELAY_MAP = [
     (60, 8.0),    # >=60% → 8s
     (40, 4.0),    # >=40% → 4s
     (20, 2.0),    # >=20% → 2s
-    (0, 0.5),     # <20%  → 0.5s
+    (0, max(settings.meta_base_delay_seconds, 0.5)),
 ]
 
 # ── Sync lock per account ────────────────────────────────────────
@@ -62,7 +63,7 @@ def _mark_rate_limited(backoff_seconds: float) -> None:
     global _usage_pct, _rate_limited_until, _consecutive_rate_limits
     with _rate_lock:
         _usage_pct = 100.0  # Force max delay for future calls
-        _rate_limited_until = time.time() + backoff_seconds
+        _rate_limited_until = time.time() + min(backoff_seconds, settings.meta_max_backoff_seconds)
         _consecutive_rate_limits += 1
     logger.info(
         f"Rate limit flagged: no API calls for {backoff_seconds:.0f}s "
@@ -146,6 +147,32 @@ def _ensure_act_prefix(account_id: str) -> str:
     return account_id
 
 
+def _get_retry_wait_seconds(
+    headers: httpx.Headers,
+    error_payload: dict[str, Any] | None,
+    attempt: int,
+) -> int:
+    """Use server-provided wait hints first, then exponential backoff."""
+    retry_after = headers.get("retry-after")
+    if retry_after:
+        try:
+            return min(int(float(retry_after)), settings.meta_max_backoff_seconds)
+        except (TypeError, ValueError):
+            pass
+
+    # Meta often sends: {"error": {"error_data": {"estimated_time_to_regain_access": <seconds>}}}
+    error_data = (error_payload or {}).get("error_data") or {}
+    regain_after = error_data.get("estimated_time_to_regain_access")
+    if regain_after is not None:
+        try:
+            return min(max(int(float(regain_after)), 1), settings.meta_max_backoff_seconds)
+        except (TypeError, ValueError):
+            pass
+
+    base_backoff = max(settings.meta_initial_backoff_seconds, 1)
+    return min(base_backoff * (2 ** attempt), settings.meta_max_backoff_seconds)
+
+
 def _graph_get(
     client: httpx.Client,
     access_token: str,
@@ -175,8 +202,8 @@ def _graph_get(
         code = error.get("code")
 
         if code in (17, 32, 4) and attempt < retries:
-            # Exponential backoff: 60s, 120s, 240s — and block ALL calls globally
-            wait = 60 * (2 ** attempt)
+            # Use server hint / adaptive exponential backoff, then block ALL calls globally
+            wait = _get_retry_wait_seconds(resp.headers, error, attempt)
             _mark_rate_limited(wait)
             logger.warning(
                 f"Rate limited (code {code}), "
@@ -281,7 +308,7 @@ def get_ad_sets(client: httpx.Client, access_token: str, account_id: str) -> lis
 
 # ── Batch API ────────────────────────────────────────────────────
 
-BATCH_SIZE = 50  # Meta allows max 50 per batch
+BATCH_SIZE = max(1, min(settings.meta_batch_size, 50))  # Meta allows max 50 per batch
 
 
 BATCH_RETRIES = 3
@@ -353,8 +380,8 @@ def _send_batch_with_retry(
             code = error.get("code")
 
             if code in (17, 32, 4) and attempt < BATCH_RETRIES:
-                # Exponential backoff: 60s, 120s, 240s — and block all calls globally
-                wait = 60 * (2 ** attempt)
+                # Use server hint / adaptive exponential backoff, then block all calls globally
+                wait = _get_retry_wait_seconds(resp.headers, error, attempt)
                 _mark_rate_limited(wait)
                 logger.warning(
                     f"Batch rate limited (code {code}), "
@@ -381,6 +408,7 @@ def _send_batch_with_retry(
 
         # Check if any individual items in the batch were rate-limited
         rate_limited_ids = []
+        rate_limited_errors: list[dict[str, Any]] = []
         for j, batch_resp in enumerate(batch_responses):
             ad_set_id = chunk[j]
             status = batch_resp.get("code", 0)
@@ -399,6 +427,7 @@ def _send_batch_with_retry(
                 err_code = error.get("code")
                 if err_code in (17, 32, 4):
                     rate_limited_ids.append(ad_set_id)
+                    rate_limited_errors.append(error)
                 else:
                     logger.warning(
                         f"Batch item {ad_set_id} failed: "
@@ -408,7 +437,7 @@ def _send_batch_with_retry(
 
         if rate_limited_ids and attempt < BATCH_RETRIES:
             # Some items rate-limited — wait and retry just those
-            wait = 60 * (2 ** attempt)
+            wait = _get_retry_wait_seconds(resp.headers, rate_limited_errors[0] if rate_limited_errors else None, attempt)
             _mark_rate_limited(wait)
             logger.warning(
                 f"{len(rate_limited_ids)} batch items rate-limited, "
